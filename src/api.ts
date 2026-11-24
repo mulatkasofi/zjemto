@@ -177,6 +177,100 @@ export async function sendSwipe(userId: string, recipeId: number, action: 'like'
   return request<SwipeResult>('POST', '/api/swipe', { user_id: userId, recipe_id: recipeId, action });
 }
 
+// ---------- fridge (API v8) ----------
+
+export type IngredientGroup = { id: number; name: string };
+
+/** ~1000 canonical ingredients the fridge search works on. Fetched once per page load. */
+let groupsPromise: Promise<IngredientGroup[]> | null = null;
+export function getIngredientGroups(): Promise<IngredientGroup[]> {
+  groupsPromise ??= request<{ groups: { group_id: number; canonical_name: string }[] | null }>(
+    'GET',
+    '/api/ingredients/groups',
+  ).then(
+    (data) =>
+      (data.groups ?? [])
+        .filter((group) => typeof group.group_id === 'number' && group.canonical_name)
+        .map((group) => ({ id: group.group_id, name: decodeEntities(group.canonical_name).trim() })),
+    (error: unknown) => {
+      groupsPromise = null; // let the next call retry
+      throw error;
+    },
+  );
+  return groupsPromise;
+}
+
+export type MissingIngredient = { name: string; groupId?: number };
+
+export type FridgeMatch = {
+  recipe: Recipe;
+  /** Ingredients the user doesn't have — null when the backend doesn't say. */
+  missing: MissingIngredient[] | null;
+  missingCount: number | null;
+};
+
+type Row = Record<string, unknown>;
+
+const isRow = (value: unknown): value is Row => !!value && typeof value === 'object' && !Array.isArray(value);
+
+/** Missing ingredients as names (c("a","b") / ["a"]) or as groups ([{group_id, canonical_name}]). */
+function parseMissing(value: unknown): MissingIngredient[] | null {
+  if (value === undefined || value === null || typeof value === 'number') return null;
+  if (Array.isArray(value) && value.some(isRow)) {
+    return value.flatMap((item) => {
+      if (!isRow(item)) return typeof item === 'string' && item.trim() ? [{ name: item.trim() }] : [];
+      const name = item.canonical_name ?? item.name ?? item.ingredient ?? item.ingredient_name;
+      if (typeof name !== 'string' || !name.trim()) return [];
+      const id = item.group_id ?? item.id;
+      return [{ name: decodeEntities(name).trim(), groupId: typeof id === 'number' ? id : undefined }];
+    });
+  }
+  if (typeof value !== 'string' && !Array.isArray(value)) return null;
+  return parseList(value as ApiList).map((name) => ({ name }));
+}
+
+const firstNumber = (...values: unknown[]) => values.find((value): value is number => typeof value === 'number') ?? null;
+
+/** One row of the fridge answer: a recipe with match info, either flat or as { recipe: {...}, missing... }. */
+function toFridgeMatch(row: unknown): FridgeMatch | null {
+  if (!isRow(row)) return null;
+  const raw = isRow(row.recipe) ? { ...row.recipe, ...row } : row;
+  if (typeof raw.recipe_id !== 'number') return null;
+  const missing = parseMissing(
+    raw.missing_ingredients ?? raw.missing_groups ?? raw.missing_ingredient_names ?? raw.missing,
+  );
+  const missingCount = firstNumber(raw.missing_count, raw.missing_ingredients_count, raw.missing) ?? missing?.length ?? null;
+  return { recipe: toRecipe(raw as unknown as ApiRecipe), missing, missingCount };
+}
+
+/** Recipes that can be made from the selected groups, allowing up to `maxMissing` extra ingredients. */
+export async function getFridgeRecipes(
+  userId: string,
+  groupIds: number[],
+  maxMissing: number,
+  limit = 20,
+): Promise<FridgeMatch[]> {
+  const data = await request<unknown>(
+    'POST',
+    `/api/recipes/fridge/${userPath(userId)}`,
+    { group_ids: groupIds, max_missing: maxMissing, limit },
+    FEED_TIMEOUT_MS,
+  );
+  const rows = Array.isArray(data) ? data : isRow(data) ? (data.recipes ?? data.results ?? data.items) : null;
+  if (!Array.isArray(rows)) {
+    // Unknown shape — better an obvious error than a silent "nothing matches".
+    console.error('ZjemTo API: unexpected fridge response', data);
+    throw new ApiError(500, 'Nieoczekiwana odpowiedź serwera.');
+  }
+  const seen = new Set<number>();
+  return rows.flatMap((row) => {
+    const match = toFridgeMatch(row);
+    if (!match || seen.has(match.recipe.apiId!)) return [];
+    seen.add(match.recipe.apiId!);
+    return [match];
+  });
+}
+
 // ---------- mapping backend recipe -> UI recipe ----------
 
 export const API_PREFIX = 'api-';
@@ -223,6 +317,12 @@ const INGREDIENT_RULES: [RegExp, string][] = [
 
 // Basics everyone has — they never count as "missing".
 const STAPLES = /^(salt|water|pepper|black pepper|sugar|granulated sugar|oil|olive oil|vegetable oil|canola oil|ice)$/;
+
+/** Local fridge-catalog id for an English ingredient name (null for staples and unknown items). */
+export function localIngredientId(name: string): string | null {
+  const lower = name.toLowerCase();
+  return STAPLES.test(lower) ? null : matchIngredient(lower);
+}
 
 function matchIngredient(name: string): string | null {
   for (const [pattern, id] of INGREDIENT_RULES) {

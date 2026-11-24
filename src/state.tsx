@@ -10,18 +10,23 @@ import {
 } from 'react';
 import type { Diet, Recipe, Screen, SwipeAction } from './types.ts';
 import { diets, recipes as localRecipes } from './data.ts';
+import { fridgeKey } from './logic.ts';
 import {
   ApiError,
   apiIdOf,
   deleteLikedRecipe,
   getAllergies,
   getFeed,
+  getFridgeRecipes,
   getLikedRecipes,
   isUserMissing,
+  localIngredientId,
   putAllergies,
   sendSwipe,
   signIn,
   signUp,
+  type FridgeMatch,
+  type IngredientGroup,
 } from './api.ts';
 
 export type ApiStatus = 'idle' | 'loading' | 'ready' | 'error';
@@ -39,6 +44,10 @@ const STORAGE_KEY = 'nyam-v1';
 
 type Store = {
   fridge: string[];
+  /** Signed-in fridge: ingredient groups from /api/ingredients/groups (names kept for display). */
+  pantry: IngredientGroup[];
+  /** How many ingredients a fridge recipe may lack (0–2, the backend's max_missing). */
+  maxMissing: number;
   liked: string[];
   passed: string[];
   history: SwipeAction[];
@@ -61,6 +70,8 @@ type Store = {
 
 const emptyStore: Store = {
   fridge: [],
+  pantry: [],
+  maxMissing: 1,
   liked: [],
   passed: [],
   history: [],
@@ -114,6 +125,19 @@ function pruneSaved(saved: Record<string, Recipe>, liked: readonly string[]) {
   return Object.fromEntries(Object.entries(saved).filter(([id]) => keep.has(id)));
 }
 
+function asPantry(value: unknown): IngredientGroup[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const row = item as { id?: unknown; name?: unknown };
+    return typeof row.id === 'number' && typeof row.name === 'string' ? [{ id: row.id, name: row.name }] : [];
+  });
+}
+
+function asMaxMissing(value: unknown) {
+  return value === 0 || value === 1 || value === 2 ? value : emptyStore.maxMissing;
+}
+
 function asDiet(value: unknown): Diet {
   return diets.some((item) => item.id === value) ? (value as Diet) : 'wszystko';
 }
@@ -128,6 +152,8 @@ function loadStore(): Store {
     const userId = asId(data.userId);
     return {
       fridge: asStrings(data.fridge),
+      pantry: asPantry(data.pantry),
+      maxMissing: asMaxMissing(data.maxMissing),
       liked: asStrings(data.liked),
       passed: asStrings(data.passed),
       history: asHistory(data.history),
@@ -159,8 +185,27 @@ function describeError(error: unknown) {
   return 'Coś poszło nie tak.';
 }
 
+export type FridgeSearch = {
+  status: ApiStatus;
+  /** Results of the last finished search. */
+  matches: FridgeMatch[];
+  /** Pantry + max_missing the results belong to — compare with `fridgeKey` to see if they are outdated. */
+  key: string;
+  error: string;
+};
+
+const emptySearch: FridgeSearch = { status: 'idle', matches: [], key: '', error: '' };
+
 type AppContextValue = {
+  /** Local catalog ids — for signed-in users derived from `pantry`, so the deck can still show what's missing. */
   fridge: string[];
+  pantry: IngredientGroup[];
+  maxMissing: number;
+  togglePantry: (group: IngredientGroup) => void;
+  clearPantry: () => void;
+  setMaxMissing: (value: number) => void;
+  fridgeSearch: FridgeSearch;
+  searchFridge: () => void;
   liked: string[];
   passed: string[];
   strict: boolean;
@@ -236,6 +281,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const [authNotice, setAuthNotice] = useState('');
   const [allergyError, setAllergyError] = useState('');
   const [apiErrorText, setApiErrorText] = useState('');
+  const [fridgeSearch, setFridgeSearch] = useState<FridgeSearch>(emptySearch);
+  const fridgeSearchRef = useRef(fridgeSearch);
+  const fridgeGen = useRef(0);
 
   const feedRef = useRef(feed);
   const storeRef = useRef(store);
@@ -253,7 +301,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     feedRef.current = feed;
     storeRef.current = store;
     modeRef.current = feedMode;
-  }, [feed, store, feedMode]);
+    fridgeSearchRef.current = fridgeSearch;
+  }, [feed, store, feedMode, fridgeSearch]);
 
   const resetFeed = useCallback((keepSwiped: boolean) => {
     genRef.current += 1;
@@ -277,6 +326,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const signOut = useCallback(
     (notice = '') => {
       resetFeed(false);
+      fridgeGen.current += 1;
+      setFridgeSearch(emptySearch);
       setApiStatus('idle');
       setAuthNotice(notice);
       setAllergyError('');
@@ -452,8 +503,12 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const pool = usingLocal ? localRecipes : feed;
 
   const getRecipe = useCallback(
-    (id: string) => localById.get(id) ?? feed.find((recipe) => recipe.id === id) ?? store.saved[id],
-    [feed, store.saved],
+    (id: string) =>
+      localById.get(id) ??
+      feed.find((recipe) => recipe.id === id) ??
+      fridgeSearch.matches.find((match) => match.recipe.id === id)?.recipe ??
+      store.saved[id],
+    [feed, fridgeSearch.matches, store.saved],
   );
 
   const authenticate = useCallback(
@@ -477,6 +532,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       }
       confirmedAllergies.current = allergies;
       resetFeed(false);
+      fridgeGen.current += 1;
+      setFridgeSearch(emptySearch);
       setAuthNotice('');
       setAllergyError(allergyProblem);
       setApiStatus('loading');
@@ -489,7 +546,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
           ownerId: userId,
           demo: false,
           allergies,
-          ...(sameOwner ? {} : { liked: [], passed: [], history: [], saved: {}, hintSeen: false }),
+          ...(sameOwner ? {} : { liked: [], passed: [], history: [], saved: {}, hintSeen: false, pantry: [] }),
         };
       });
       setScreen('deck');
@@ -543,7 +600,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
 
   const like = useCallback(
     (id: string) => {
-      const recipe = feedRef.current.find((item) => item.id === id);
+      const recipe =
+        feedRef.current.find((item) => item.id === id) ??
+        fridgeSearchRef.current.matches.find((match) => match.recipe.id === id)?.recipe;
       setStore((current) => ({
         ...current,
         saved: recipe ? { ...current.saved, [id]: recipe } : current.saved,
@@ -618,6 +677,48 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     setStore((current) => ({ ...current, fridge: [] }));
   }, []);
 
+  const togglePantry = useCallback((group: IngredientGroup) => {
+    setStore((current) => ({
+      ...current,
+      pantry: current.pantry.some((item) => item.id === group.id)
+        ? current.pantry.filter((item) => item.id !== group.id)
+        : [...current.pantry, group],
+    }));
+  }, []);
+
+  const clearPantry = useCallback(() => {
+    setStore((current) => ({ ...current, pantry: [] }));
+  }, []);
+
+  const setMaxMissing = useCallback((value: number) => {
+    setStore((current) => ({ ...current, maxMissing: asMaxMissing(value) }));
+  }, []);
+
+  /** Takes up to ~5 s on the backend (plus a cold start) — the screen shows a loader meanwhile. */
+  const searchFridge = useCallback(() => {
+    const { userId, pantry, maxMissing } = storeRef.current;
+    if (!userId || pantry.length === 0) return;
+    const gen = ++fridgeGen.current;
+    const key = fridgeKey(pantry, maxMissing);
+    setFridgeSearch((current) => ({ ...current, status: 'loading', error: '' }));
+    getFridgeRecipes(
+      userId,
+      pantry.map((group) => group.id),
+      maxMissing,
+    ).then(
+      (matches) => {
+        if (gen !== fridgeGen.current) return;
+        setFridgeSearch({ status: 'ready', matches, key, error: '' });
+      },
+      (error: unknown) => {
+        if (gen !== fridgeGen.current) return;
+        if (handleLostUser(error)) return;
+        console.error('ZjemTo API: fridge', error);
+        setFridgeSearch((current) => ({ ...current, status: 'error', error: describeError(error) }));
+      },
+    );
+  }, [handleLostUser]);
+
   const toggleStrict = useCallback(() => {
     setStore((current) => ({ ...current, strict: !current.strict }));
   }, []);
@@ -648,12 +749,27 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
 
   const signOutPlain = useCallback(() => signOut(), [signOut]);
 
+  // Signed in: the deck compares cards with the backend fridge, mapped onto the local catalog.
+  const derivedFridge = useMemo(
+    // Same ids toRecipe() gives recipe ingredients: a catalog id, or `x:<name>` for everything else.
+    () => [...new Set(store.pantry.map((group) => localIngredientId(group.name) ?? `x:${group.name.toLowerCase()}`))],
+    [store.pantry],
+  );
+
   const value = useMemo<AppContextValue>(
     () => ({
-      fridge: store.fridge,
+      fridge: store.userId ? derivedFridge : store.fridge,
+      pantry: store.pantry,
+      maxMissing: store.maxMissing,
+      togglePantry,
+      clearPantry,
+      setMaxMissing,
+      fridgeSearch,
+      searchFridge,
       liked: visibleLiked,
       passed: visiblePassed,
-      strict: store.strict,
+      // The "only what I have" deck filter belongs to the local fridge; the server fridge has max_missing instead.
+      strict: store.userId ? false : store.strict,
       hintSeen: store.hintSeen,
       profileName: store.profileName,
       diet: store.diet,
@@ -697,6 +813,12 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     }),
     [
       store,
+      derivedFridge,
+      togglePantry,
+      clearPantry,
+      setMaxMissing,
+      fridgeSearch,
+      searchFridge,
       visibleLiked,
       visiblePassed,
       authNotice,
