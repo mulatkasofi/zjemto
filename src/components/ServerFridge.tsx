@@ -70,6 +70,12 @@ export function ServerFridge() {
     };
   }, [attempt]);
 
+  // Saved ids the backend no longer has (database rebuilt) would make the whole request fail with 422.
+  const { prunePantry } = app;
+  useEffect(() => {
+    if (groups) prunePantry(new Set(groups.map((group) => group.id)));
+  }, [groups, prunePantry]);
+
   const selected = useMemo(() => new Set(pantry.map((group) => group.id)), [pantry]);
   const byId = useMemo(() => new Map((groups ?? []).map((group) => [group.id, group])), [groups]);
   const byName = useMemo(() => new Map((groups ?? []).map((group) => [group.name.toLowerCase(), group])), [groups]);
@@ -97,6 +103,8 @@ export function ServerFridge() {
   }, [groups]);
 
   const loading = fridgeSearch.status === 'loading';
+  // The backend ranks fridge recipes by taste, so it answers 409 until calibration (20 swipes) is done.
+  const calibrating = app.feedMode === 'calibration';
   const currentKey = fridgeKey(pantry, maxMissing);
   const outdated = fridgeSearch.key !== '' && fridgeSearch.key !== currentKey;
   const passed = new Set(app.passed);
@@ -225,7 +233,7 @@ export function ServerFridge() {
                 </button>
               ))}
             </div>
-            <button className="btn flame" type="button" disabled={pantry.length === 0 || loading} onClick={search}>
+            <button className="btn flame" type="button" disabled={pantry.length === 0 || loading || calibrating} onClick={search}>
               {loading ? 'Szukam…' : outdated ? 'Odśwież przepisy' : 'Pokaż przepisy'}
             </button>
           </div>
@@ -234,7 +242,19 @@ export function ServerFridge() {
         <div ref={resultsRef} className="fridge-results-wrap">
           {loading && <FridgeLoader pantry={pantry} />}
 
-          {!loading && fridgeSearch.status === 'error' && (
+          {!loading && (calibrating || fridgeSearch.needsCalibration) && (
+            <div className="fridge-message">
+              <p>
+                Lodówka dobiera przepisy pod Twój gust — najpierw oceń przepisy w talii
+                {app.calibration ? ` (${app.calibration.current} z ${app.calibration.required})` : ''}.
+              </p>
+              <button className="btn tiny" type="button" onClick={() => app.setScreen('deck')}>
+                Do talii
+              </button>
+            </div>
+          )}
+
+          {!loading && fridgeSearch.status === 'error' && !fridgeSearch.needsCalibration && (
             <div className="fridge-message">
               <p>{fridgeSearch.error || 'Nie udało się pobrać przepisów.'}</p>
               <button className="btn tiny" type="button" onClick={search}>
@@ -262,7 +282,7 @@ export function ServerFridge() {
                     {matches.length} {plural(matches.length, 'przepis', 'przepisy', 'przepisów')} z Twojej lodówki
                   </p>
                   <ul className="fridge-results">
-                    {matches.map(({ recipe, missing, missingCount }) => (
+                    {matches.map(({ recipe, missing, missingCount, total }) => (
                       <li key={recipe.id}>
                         <button type="button" className="fridge-result" onClick={() => setOpenId(recipe.id)}>
                           <Photo src={recipe.image} tint={recipe.tint} />
@@ -275,6 +295,7 @@ export function ServerFridge() {
                         <MissingLine
                           missing={missing}
                           count={missingCount}
+                          total={total}
                           find={(item) =>
                             (item.groupId !== undefined ? byId.get(item.groupId) : undefined) ?? byName.get(item.name.toLowerCase())
                           }
@@ -313,17 +334,21 @@ export function ServerFridge() {
 type MissingLineProps = {
   missing: MissingIngredient[] | null;
   count: number | null;
+  total: number | null;
   find: (item: MissingIngredient) => IngredientGroup | undefined;
   selected: ReadonlySet<number>;
   onAdd: (group: IngredientGroup) => void;
 };
 
-function MissingLine({ missing, count, find, selected, onAdd }: MissingLineProps) {
+function MissingLine({ missing, count, total, find, selected, onAdd }: MissingLineProps) {
   if (count === 0 || (missing && missing.length === 0)) return <p className="fridge-missing ok">Masz wszystko</p>;
   if (!missing) {
-    return count === null ? null : (
+    if (count === null) return null;
+    return (
       <p className="fridge-missing">
-        Brakuje {count} {plural(count, 'składnika', 'składników', 'składników')}
+        {total
+          ? `Brakuje ${count} z ${total} ${plural(total, 'składnika', 'składników', 'składników')}`
+          : `Brakuje ${count} ${plural(count, 'składnika', 'składników', 'składników')}`}
       </p>
     );
   }

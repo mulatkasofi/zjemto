@@ -21,6 +21,7 @@ import {
   getLikedRecipes,
   isUserMissing,
   localIngredientId,
+  unknownGroupIds,
   putAllergies,
   sendSwipe,
   signIn,
@@ -192,9 +193,11 @@ export type FridgeSearch = {
   /** Pantry + max_missing the results belong to — compare with `fridgeKey` to see if they are outdated. */
   key: string;
   error: string;
+  /** 409: the backend needs a calibrated taste profile (20 swipes) before it ranks fridge recipes. */
+  needsCalibration: boolean;
 };
 
-const emptySearch: FridgeSearch = { status: 'idle', matches: [], key: '', error: '' };
+const emptySearch: FridgeSearch = { status: 'idle', matches: [], key: '', error: '', needsCalibration: false };
 
 type AppContextValue = {
   /** Local catalog ids — for signed-in users derived from `pantry`, so the deck can still show what's missing. */
@@ -203,6 +206,8 @@ type AppContextValue = {
   maxMissing: number;
   togglePantry: (group: IngredientGroup) => void;
   clearPantry: () => void;
+  /** Drops selected groups the backend no longer knows. */
+  prunePantry: (validIds: ReadonlySet<number>) => void;
   setMaxMissing: (value: number) => void;
   fridgeSearch: FridgeSearch;
   searchFridge: () => void;
@@ -690,6 +695,14 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     setStore((current) => ({ ...current, pantry: [] }));
   }, []);
 
+  const prunePantry = useCallback((validIds: ReadonlySet<number>) => {
+    setStore((current) =>
+      current.pantry.every((group) => validIds.has(group.id))
+        ? current
+        : { ...current, pantry: current.pantry.filter((group) => validIds.has(group.id)) },
+    );
+  }, []);
+
   const setMaxMissing = useCallback((value: number) => {
     setStore((current) => ({ ...current, maxMissing: asMaxMissing(value) }));
   }, []);
@@ -700,7 +713,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     if (!userId || pantry.length === 0) return;
     const gen = ++fridgeGen.current;
     const key = fridgeKey(pantry, maxMissing);
-    setFridgeSearch((current) => ({ ...current, status: 'loading', error: '' }));
+    setFridgeSearch((current) => ({ ...current, status: 'loading', error: '', needsCalibration: false }));
     getFridgeRecipes(
       userId,
       pantry.map((group) => group.id),
@@ -708,13 +721,31 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     ).then(
       (matches) => {
         if (gen !== fridgeGen.current) return;
-        setFridgeSearch({ status: 'ready', matches, key, error: '' });
+        setFridgeSearch({ status: 'ready', matches, key, error: '', needsCalibration: false });
       },
       (error: unknown) => {
         if (gen !== fridgeGen.current) return;
         if (handleLostUser(error)) return;
-        console.error('ZjemTo API: fridge', error);
-        setFridgeSearch((current) => ({ ...current, status: 'error', error: describeError(error) }));
+        const unknown = unknownGroupIds(error);
+        if (unknown.length > 0) {
+          const gone = new Set(unknown);
+          setStore((current) => ({ ...current, pantry: current.pantry.filter((group) => !gone.has(group.id)) }));
+          setFridgeSearch((current) => ({
+            ...current,
+            status: 'error',
+            error: 'Część produktów zniknęła z bazy — usunęliśmy je z lodówki. Spróbuj jeszcze raz.',
+            needsCalibration: false,
+          }));
+          return;
+        }
+        const needsCalibration = error instanceof ApiError && error.status === 409;
+        if (!needsCalibration) console.error('ZjemTo API: fridge', error);
+        setFridgeSearch((current) => ({
+          ...current,
+          status: 'error',
+          error: needsCalibration ? '' : describeError(error),
+          needsCalibration,
+        }));
       },
     );
   }, [handleLostUser]);
@@ -763,6 +794,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       maxMissing: store.maxMissing,
       togglePantry,
       clearPantry,
+      prunePantry,
       setMaxMissing,
       fridgeSearch,
       searchFridge,
@@ -816,6 +848,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       derivedFridge,
       togglePantry,
       clearPantry,
+      prunePantry,
       setMaxMissing,
       fridgeSearch,
       searchFridge,

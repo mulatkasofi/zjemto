@@ -207,6 +207,8 @@ export type FridgeMatch = {
   /** Ingredients the user doesn't have — null when the backend doesn't say. */
   missing: MissingIngredient[] | null;
   missingCount: number | null;
+  /** Required (non-optional) ingredients of the recipe — `total_required` in API v8. */
+  total: number | null;
 };
 
 type Row = Record<string, unknown>;
@@ -240,7 +242,8 @@ function toFridgeMatch(row: unknown): FridgeMatch | null {
     raw.missing_ingredients ?? raw.missing_groups ?? raw.missing_ingredient_names ?? raw.missing,
   );
   const missingCount = firstNumber(raw.missing_count, raw.missing_ingredients_count, raw.missing) ?? missing?.length ?? null;
-  return { recipe: toRecipe(raw as unknown as ApiRecipe), missing, missingCount };
+  const total = firstNumber(raw.total_required, raw.total_count);
+  return { recipe: toRecipe(raw as unknown as ApiRecipe), missing, missingCount, total };
 }
 
 /** Recipes that can be made from the selected groups, allowing up to `maxMissing` extra ingredients. */
@@ -269,6 +272,19 @@ export async function getFridgeRecipes(
     seen.add(match.recipe.apiId!);
     return [match];
   });
+}
+
+/** 422 from /recipes/fridge: {"detail": {"unknown_group_ids": [..]}} — e.g. saved ids after the database was rebuilt. */
+export function unknownGroupIds(error: unknown): number[] {
+  if (!(error instanceof ApiError) || error.status !== 422) return [];
+  try {
+    const detail = JSON.parse(error.message) as { unknown_group_ids?: unknown };
+    return Array.isArray(detail.unknown_group_ids)
+      ? detail.unknown_group_ids.filter((id): id is number => typeof id === 'number')
+      : [];
+  } catch {
+    return [];
+  }
 }
 
 // ---------- mapping backend recipe -> UI recipe ----------
